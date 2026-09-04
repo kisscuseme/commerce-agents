@@ -315,6 +315,7 @@ class MerchantAgent:
                 finally:
                     if not persisted and runner.result.message is not None:
                         bridge.append_assistant(runner.result.message)
+                    settled.update(dispatcher.settled_outcomes())
                     dispatcher.cancel()
 
                 calls = list(zip(tool_uses, outcomes, strict=True))
