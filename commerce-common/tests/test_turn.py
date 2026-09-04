@@ -1,6 +1,7 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
 import logging
 from types import SimpleNamespace
@@ -62,6 +63,25 @@ async def test_eager_dispatcher_accepts_canonical_arguments_and_runs_once():
     outcomes = await dispatcher.collect([block])
     assert [o.result_text for o in outcomes] == ["ok"]
     assert calls == [("search", {"q": "tent"})]
+
+
+@pytest.mark.asyncio
+async def test_completed_eager_outcome_can_be_recovered_before_cancel():
+    finished = asyncio.Event()
+
+    async def execute(name, args):
+        finished.set()
+        return ToolOutcome("write completed")
+
+    dispatcher = EagerDispatcher(execute, enabled=True)
+    assert dispatcher.dispatch("stage_price_update", "c-write", {"price": 26})
+    await asyncio.wait_for(finished.wait(), 0.2)
+    await asyncio.sleep(0)
+
+    settled = dispatcher.settled_outcomes()
+
+    assert settled["c-write"].result_text == "write completed"
+    dispatcher.cancel()
 
 
 DISPLAYED = "Displayed."
