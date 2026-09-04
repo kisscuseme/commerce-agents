@@ -182,6 +182,19 @@ class EagerDispatcher:
         settled.set_result(outcome)
         self._tasks[tool_use_id] = settled
 
+    def settled_outcomes(self) -> dict[str, ToolOutcome]:
+        """Completed successful task results safe to persist before interruption cleanup."""
+        results: dict[str, ToolOutcome] = {}
+        for tool_use_id, task in self._tasks.items():
+            if not task.done() or task.cancelled():
+                continue
+            try:
+                outcome = task.result()
+            except BaseException:
+                continue
+            results[tool_use_id] = outcome
+        return results
+
     async def collect(self, tool_uses: Iterable[Any]) -> list[ToolOutcome]:
         blocks = list(tool_uses)
         return await asyncio.gather(
