@@ -1,32 +1,39 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 
-"""The analysis delegate: a separate model loop, run inside the analysis tool call,
-whose tools are the merchant read tools plus a submission tool and, per deployment, a
-SELECT-only query method and the hosted code sandbox. The brief goes in and one validated
-:class:`~merchant_agent.AnalysisResult` comes out; neither the conversation nor the
-gathered data crosses in the other direction. Reads go through the ordinary executor,
-and only the snapshot and series they gather reach the session: listing and campaign ids
-feed the staged-write gates, which an analysis run must not widen.
-"""
+"""Provider-neutral merchant analysis delegate with optional hosted code execution."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
 from typing import Any, cast
 
-from anthropic import AsyncAnthropic
 from pydantic import BaseModel, ValidationError
 
+from commerce_model_runtime import (
+    ModelMessage,
+    ModelOperation,
+    ModelRequest,
+    ModelRequestMetadata,
+    ModelRuntime,
+    ProviderState,
+    SegmentStability,
+    StopReason,
+    SystemSegment,
+    TextContent,
+    ToolCallContent,
+    ToolChoice,
+    ToolResultContent,
+    validate_capabilities,
+)
 from commerce_common.delegation import DelegateExtension, DelegationContext
 from commerce_common.execution import without_status
-from commerce_common.prompt_assembly import with_tool_cache_control
+from commerce_common.model_round import accumulate_model_usage
+from commerce_common.prompt_assembly import build_cache_policy, build_model_tools
 from commerce_common.skills import SkillRegistry
 from commerce_common.streaming import AgentEvent
-from commerce_common.turn import accumulate_usage, log_model_call
 from merchant_agent import (
     AnalysisResult,
     AnalysisTable,
@@ -57,10 +64,6 @@ from merchant_agent.tools.registry import build_tools
 
 logger = logging.getLogger(__name__)
 
-# Step lines are composed from this map only; model-authored lines arrive through
-# report_progress, which sanitizes them. Keys are names of client tool_use blocks; the
-# sandbox's own server_tool_use blocks are not collected, so a step that only ran code
-# reads "working".
 _STEP_VERBS = {
     "get_business_snapshot": "reading the snapshot",
     "query_metrics": "querying metrics",
@@ -68,13 +71,10 @@ _STEP_VERBS = {
     "search_listings": "scanning listings",
     ANALYSIS_QUERY_TOOL: "running a query",
 }
-
-# Responses that only report progress are free this many times, then count as iterations.
 _PROGRESS_ONLY_GRACE = 3
 
 
 def present_analysis(result: BaseModel, context: DelegationContext) -> tuple[Any, list[AgentEvent]]:
-    """The result recorded on the session and rendered as a metrics card from the record."""
     analysis = cast(AnalysisResult, result)
     context.state.remember_analysis(analysis)
     return summarize_result_for_model(analysis), [
@@ -83,10 +83,12 @@ def present_analysis(result: BaseModel, context: DelegationContext) -> tuple[Any
 
 
 def build_analysis_delegate(
-    client: AsyncAnthropic, backend: MerchantBackend, config: MerchantAgentConfig
+    runtime: ModelRuntime,
+    backend: MerchantBackend,
+    config: MerchantAgentConfig,
 ) -> DelegateExtension:
     definition = build_analysis_tool_definition()
-    runner = AnalysisRunner(client=client, backend=backend, config=config)
+    runner = AnalysisRunner(runtime=runtime, backend=backend, config=config)
     return DelegateExtension(
         name=ANALYSIS_TOOL,
         description=definition["description"],
@@ -102,29 +104,37 @@ def backend_supports_analysis_query(backend: MerchantBackend) -> bool:
 
 
 class AnalysisRunner:
-    """Builds the delegate's tool surface once per deployment and runs one loop per call."""
-
     def __init__(
-        self, *, client: AsyncAnthropic, backend: MerchantBackend, config: MerchantAgentConfig
+        self, *, runtime: ModelRuntime, backend: MerchantBackend, config: MerchantAgentConfig
     ) -> None:
-        self._client = client
+        self._runtime = runtime
         self._backend = backend
         self._config = config
+        self._target = config.analysis_target()
+        operation = (
+            ModelOperation.HOSTED_ANALYSIS
+            if config.analysis_use_code_execution
+            else ModelOperation.PORTABLE_ANALYSIS
+        )
+        validate_capabilities(
+            operation,
+            runtime.capabilities_for(self._target),
+            require_hosted_code_execution=config.analysis_use_code_execution,
+        )
         self._system = build_analysis_system_prompt(config)
         self._sql_supported = backend_supports_analysis_query(backend)
         self._tools = self._build_tools()
 
-    def _build_tools(self) -> list[dict[str, Any]]:
+    def _build_tools(self):
         registry = build_tools(self._config, [])
-        # With query support, analysis_sql_only leaves the per-series reads off the
-        # surface; without it, the reads are the only data source.
         sql_only = self._sql_supported and self._config.analysis_sql_only
-        # Nobody watches the delegate's calls, so its reads carry no status line.
         tools = (
             []
             if sql_only
             else [
-                without_status(tool) for tool in registry if tool.get("name") in ANALYSIS_READ_TOOLS
+                without_status(tool)
+                for tool in registry
+                if tool.get("name") in ANALYSIS_READ_TOOLS
             ]
         )
         tools.append(build_submit_analysis_tool())
@@ -132,17 +142,10 @@ class AnalysisRunner:
         if self._sql_supported:
             tools.append(build_analysis_query_tool())
         if self._config.analysis_use_code_execution:
-            # The sandbox calls the tools itself, so bulk data stays out of the delegate's text.
-            for tool in tools:
-                tool["allowed_callers"] = [CODE_EXECUTION_TOOL_TYPE]
             tools.append({"type": CODE_EXECUTION_TOOL_TYPE, "name": "code_execution"})
-        return with_tool_cache_control(tools)
+        return build_model_tools(tools)
 
     async def _task_brief(self, session: Any, args: dict[str, Any]) -> str:
-        """The opening message: the brief, plus the backend's schema notes when queries
-        are supported. The brief's strings are cut to size again here; the schema's limits
-        describe what the model was asked to send, not what it sent."""
-
         def _clamp(value: Any, limit: int = 300) -> Any:
             if isinstance(value, str):
                 return value[:limit]
@@ -155,7 +158,7 @@ class AnalysisRunner:
         if self._sql_supported:
             try:
                 schema = await self._backend.get_analysis_schema(session)
-            except Exception:  # the run proceeds without schema notes
+            except Exception:
                 logger.warning("get_analysis_schema failed; briefing without it", exc_info=True)
                 schema = None
             if schema:
@@ -165,8 +168,6 @@ class AnalysisRunner:
         return text
 
     async def run(self, context: DelegationContext, args: dict[str, Any]) -> AnalysisResult:
-        """The validated submission. Raises ``ValueError``, naming what was gathered,
-        when the iteration or wall-clock budget runs out first."""
         trace: list[str] = []
         series_names: list[str] = []
         try:
@@ -187,12 +188,14 @@ class AnalysisRunner:
         trace: list[str],
         series_names: list[str],
     ) -> AnalysisResult:
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": await self._task_brief(context.session, args)}
+        messages: list[ModelMessage] = [
+            ModelMessage(
+                role="user",
+                content=[TextContent(await self._task_brief(context.session, args))],
+            )
         ]
         nudged = False
-        # Once a response has run code, later requests must name its container.
-        container_id: str | None = None
+        provider_state: ProviderState | None = None
         iterations = 0
         progress_grace_used = 0
         step = 0
@@ -201,51 +204,42 @@ class AnalysisRunner:
         while iterations < self._config.max_analysis_iterations:
             step += 1
             self._auto_progress(context, step, last_tool_names)
-            request: dict[str, Any] = {
-                "model": self._config.analysis_model or self._config.model,
-                "max_tokens": self._config.analysis_max_tokens,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": self._system,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "tools": self._tools,
-                "messages": messages,
-                **self._config.thinking_request_fields(),
-            }
-            if container_id is not None:
-                request["container"] = container_id
-            call_started = time.monotonic()
-            response = await self._client.messages.create(**request)
-            log_model_call(
-                logger,
-                request,
-                response,
-                call_started,
-                context.session.session_id,
-                step=step,
+            response = await self._runtime.complete(
+                ModelRequest(
+                    target=self._target,
+                    system=[SystemSegment(self._system, SegmentStability.STATIC)],
+                    tools=self._tools,
+                    tool_choice=ToolChoice.auto(),
+                    messages=messages,
+                    max_tokens=self._config.analysis_max_tokens,
+                    reasoning=self._config.reasoning_config(),
+                    cache=build_cache_policy(False),
+                    provider_state=provider_state,
+                    metadata=ModelRequestMetadata(
+                        operation="merchant_analysis",
+                        data_classification="business_operational_data",
+                        attributes={"step": str(step)},
+                    ),
+                )
             )
+            provider_state = response.provider_state
             if context.usage is not None:
-                accumulate_usage(context.usage, response)
-            container = getattr(response, "container", None)
-            if container is not None and getattr(container, "id", None):
-                container_id = container.id
-            content_dicts = [
-                block.model_dump(exclude_none=True, exclude={"citations"})
-                for block in response.content
-            ]
-            if content_dicts:
-                messages.append({"role": "assistant", "content": content_dicts})
+                accumulate_model_usage(context.usage, response.usage)
+            if response.message is not None and response.message.content:
+                messages.append(response.message)
 
-            # Answered whatever the stop reason: a paused sandbox turn with a pending
-            # client call is rejected on resume unless the call has its result.
-            tool_uses = [block for block in response.content if block.type == "tool_use"]
-            trace.append(
-                f"{response.stop_reason}:"
-                + (",".join(sorted({block.type for block in response.content})) or "empty")
+            tool_uses = [
+                block
+                for block in (response.message.content if response.message else [])
+                if isinstance(block, ToolCallContent)
+            ]
+            kinds = sorted(
+                {
+                    type(block).__name__
+                    for block in (response.message.content if response.message else [])
+                }
             )
+            trace.append(f"{response.stop_reason.value}:" + (",".join(kinds) or "empty"))
             is_progress_only = bool(tool_uses) and all(
                 block.name == REPORT_PROGRESS_TOOL for block in tool_uses
             )
@@ -255,27 +249,28 @@ class AnalysisRunner:
                 iterations += 1
             last_tool_names = [block.name for block in tool_uses]
             if not tool_uses:
-                if response.stop_reason == "pause_turn":
-                    # The sandbox ran out of server-side iterations; resending resumes it.
+                if response.stop_reason is StopReason.PAUSE:
                     continue
                 if nudged:
                     break
                 nudged = True
                 messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Submit now with {SUBMIT_ANALYSIS_TOOL} — either the findings, "
-                            "or a submission stating why the data cannot answer the question."
-                        ),
-                    }
+                    ModelMessage(
+                        role="user",
+                        content=[
+                            TextContent(
+                                f"Submit now with {SUBMIT_ANALYSIS_TOOL} — either the findings, "
+                                "or a submission stating why the data cannot answer the question."
+                            )
+                        ],
+                    )
                 )
                 continue
 
             submitted: AnalysisResult | None = None
-            tool_results: list[dict[str, Any]] = []
+            tool_results: list[ToolResultContent] = []
             for block in tool_uses:
-                tool_input = dict(block.input or {})
+                tool_input = dict(block.arguments)
                 if block.name == SUBMIT_ANALYSIS_TOOL:
                     try:
                         submitted = AnalysisResult.model_validate(tool_input)
@@ -292,14 +287,13 @@ class AnalysisRunner:
                         context, block.name, tool_input, series_names
                     )
                 tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_text,
-                        "is_error": is_error,
-                    }
+                    ToolResultContent(
+                        tool_call_id=block.id,
+                        content=result_text,
+                        is_error=is_error,
+                    )
                 )
-            messages.append({"role": "user", "content": tool_results})
+            messages.append(ModelMessage(role="user", content=tool_results))
             if submitted is not None:
                 return submitted
 
@@ -309,7 +303,6 @@ class AnalysisRunner:
         )
 
     def _auto_progress(self, context: DelegationContext, step: int, last_tools: list[str]) -> None:
-        # The executor emitted the opener, so step 1 has nothing to add.
         if context.emit_status is None or step == 1:
             return
         verbs = sorted({_STEP_VERBS.get(name, "working") for name in last_tools} or {"working"})
@@ -328,7 +321,6 @@ class AnalysisRunner:
         tool_input: dict[str, Any],
         series_names: list[str],
     ) -> tuple[str, bool]:
-        # A scratch state keeps listing and campaign ids out of the session's gates.
         scratch = MerchantSessionState()
         reads = MerchantToolExecutor(
             backend=self._backend,
@@ -353,7 +345,6 @@ class AnalysisRunner:
         series_names: list[str],
     ) -> tuple[str, bool]:
         if name == REPORT_PROGRESS_TOOL:
-            # Sanitized here; the executor's status channel applies the display clamp.
             message = self._sanitize(str(tool_input.get("message", "")), None)
             if message and context.emit_status is not None:
                 context.emit_status(message)
@@ -370,7 +361,7 @@ class AnalysisRunner:
                 "Narrow the query and try again.",
                 True,
             )
-        except Exception as error:  # a failed query must not end the run
+        except Exception as error:
             logger.warning("analysis tool %s failed", name, exc_info=True)
             return f"{name} failed: {self._sanitize(str(error), 200) or 'unavailable'}", True
 
@@ -381,8 +372,6 @@ class AnalysisRunner:
                 "SELECT statement.",
                 True,
             )
-        # asyncio.timeout rather than wait_for: on 3.11 wait_for can report the outer
-        # run timeout's cancellation as this query's TimeoutError.
         async with asyncio.timeout(self._config.analysis_query_timeout_s):
             table = await self._backend.execute_analysis_query(session, sql)
         if table is None:
