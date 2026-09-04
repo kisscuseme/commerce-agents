@@ -29,6 +29,7 @@ from commerce_model_runtime.providers import AnthropicRuntime
 from commerce_common.conversation import LegacyConversationBridge
 from commerce_common.grounding import first_forced_tool
 from commerce_common.memory import MemoryRuntime, MemoryStore, MemoryWriteFilter
+from commerce_common.model_memory import extract_memory
 from commerce_common.model_round import (
     ModelRoundRunner,
     accumulate_model_usage,
@@ -287,8 +288,15 @@ class ShoppingAgent:
     ) -> list[MemoryFact]:
         bridge = LegacyConversationBridge(messages)
         transcript = bridge.transcript_text(bridge.latest_exchange())
-        return await self.memory.extract(
-            self.client, session.user_id, session.session_id, transcript
+        target = self.config.memory_target()
+        runtime = self.runtimes.resolve(target)
+        return await extract_memory(
+            self.memory,
+            runtime,
+            target,
+            session.user_id,
+            session.session_id,
+            transcript,
         )
 
     async def _prefetch(
