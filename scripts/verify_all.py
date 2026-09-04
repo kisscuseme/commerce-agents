@@ -1,8 +1,9 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 
-"""The full verification loop: lint, format check, check.py, pytest, deploy dry-runs, the eight
-web builds, and (with --live) a scripted conversation against the API.
+"""The full verification loop: lint, format check, consistency checks, pytest,
+deploy dry-runs, the eight web builds, and (with --live) a scripted conversation
+against the API.
 
     python scripts/verify_all.py            # everything that runs without API access
     python scripts/verify_all.py --live     # adds the live smoke conversation
@@ -66,6 +67,10 @@ def main() -> int:
         Step("lint (ruff check)", [PYTHON, "-m", "ruff", "check", "."]),
         Step("format (ruff format --check)", [PYTHON, "-m", "ruff", "format", "--check", "."]),
         Step("repo consistency (check.py)", [PYTHON, "scripts/check.py"]),
+        Step(
+            "model runtime consistency",
+            [PYTHON, "scripts/check_model_runtime.py"],
+        ),
         Step("tests (pytest)", [PYTHON, "-m", "pytest", "-q"]),
         Step(
             "managed-agents deploy dry-run (shopping-agent)",
