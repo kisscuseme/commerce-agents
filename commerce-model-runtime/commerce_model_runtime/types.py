@@ -36,15 +36,15 @@ class ToolChoice:
             raise ValueError("tool name is only valid for specific tool choice")
 
     @classmethod
-    def auto(cls) -> ToolChoice:
+    def auto(cls) -> "ToolChoice":
         return cls(ToolChoiceMode.AUTO)
 
     @classmethod
-    def none(cls) -> ToolChoice:
+    def none(cls) -> "ToolChoice":
         return cls(ToolChoiceMode.NONE)
 
     @classmethod
-    def specific(cls, name: str) -> ToolChoice:
+    def specific(cls, name: str) -> "ToolChoice":
         return cls(ToolChoiceMode.SPECIFIC, name=name)
 
 
@@ -192,6 +192,7 @@ class StopReason(str, Enum):
     MAX_TOKENS = "max_tokens"
     CONTENT_FILTER = "content_filter"
     PAUSE = "pause"
+    ABANDONED = "abandoned"
     ERROR = "error"
     UNKNOWN = "unknown"
 
