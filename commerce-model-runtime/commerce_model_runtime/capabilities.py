@@ -63,7 +63,7 @@ _MAIN_REQUIRED = {
     "tool_choice_specific",
     "multiple_tool_calls",
 }
-_MEMORY_REQUIRED = {"function_tools", "tool_choice_specific"}
+_MEMORY_REQUIRED = {"function_tools", "tool_choice_auto"}
 _ANALYSIS_REQUIRED = {"function_tools", "tool_result_continuation", "multiple_tool_calls"}
 _OPTIONAL_PERFORMANCE = {"prompt_cache", "stream_tool_arguments"}
 
