@@ -1,135 +1,133 @@
-# Deployment platforms
+# Deployment platforms and model runtimes
 
-The code calls the Anthropic API by default. Each runtime path has one place where a
-deployment points it at GCP Vertex AI, AWS Bedrock, Microsoft Foundry, or an in-house
-gateway instead. Everything here applies to both roles; the examples use the shopping
-names, and `MerchantAgent`, `merchant_agent_sdk`, and `merchant-agent/managed-agents/`
-substitute one for one.
+The Messages-style Shopping and Merchant runtimes now depend on the provider-neutral
+`commerce-model-runtime` contract. The v1 foundation keeps Anthropic as the default and
+ships `AnthropicRuntime` as the golden-reference adapter. OpenAI and Gemini adapters are
+implemented in separate follow-on plans; do not set `provider="openai"` or
+`provider="gemini"` until those runtimes are registered by the deployment.
 
-## Support matrix
+Claude Agent SDK and Managed Agents are deliberately unchanged and remain Claude-specific.
+The provider-neutral work applies only to `shopping-agent/runtime-messages-api` and
+`merchant-agent/runtime-messages-api`.
 
-| Path | Anthropic API | GCP Vertex AI | AWS Bedrock | Microsoft Foundry | In-house gateway |
-|---|---|---|---|---|---|
-| Messages API runtimes | Yes | Yes | Yes | Yes | Yes |
-| Agent SDK runtimes | Yes | Yes | Yes | Yes | Yes |
-| Managed Agents | Yes | No | No¹ | No | Yes² |
-| Merchant analysis, hosted code execution | Yes | No | No | Yes³ | No |
-| Merchant analysis, `execute_analysis_query` | Yes | Yes | Yes | Yes | Yes |
+## Runtime selection
 
-How each path selects the platform:
+Each Messages agent accepts three mutually exclusive injection forms:
 
-| Path | Where set | Anthropic API | GCP Vertex AI | AWS Bedrock | Microsoft Foundry | In-house gateway |
-|---|---|---|---|---|---|---|
-| Messages API runtimes | `client=` on the agent | default | `AsyncAnthropicVertex` | `AsyncAnthropicBedrockMantle` or `AsyncAnthropicBedrock` | `AsyncAnthropicFoundry` | `AsyncAnthropic(base_url=..., auth_token=...)` |
-| Agent SDK runtimes | `options.env` | default | `CLAUDE_CODE_USE_VERTEX=1` | `CLAUDE_CODE_USE_BEDROCK=1` or `CLAUDE_CODE_USE_MANTLE=1` | `CLAUDE_CODE_USE_FOUNDRY=1` | `ANTHROPIC_BASE_URL` |
-| Managed Agents | `ANTHROPIC_API_URL` for the deploy script | default | — | — | — | `ANTHROPIC_API_URL` |
-
-¹ See the AWS note below. ² Through a pass-through proxy for the deploy script and session endpoints; see
-"Managed Agents: the endpoint". ³ Foundry deployments hosted on Anthropic
-only.
-
-The two analysis rows apply to merchant deployments with `enable_analysis` on. Hosted code
-execution (`analysis_use_code_execution`) mounts the `code_execution_20260120` server tool,
-which the Anthropic API serves; a Foundry deployment hosted on Anthropic also serves it.
-`MerchantBackend.execute_analysis_query` runs in your infrastructure and returns an
-ordinary tool result, so it works everywhere. The retail example uses the query method and
-mounts the sandbox only when `MERCHANT_ANALYSIS_CODE_EXECUTION=1` is set.
-
-AWS note: Managed Agents runs on Anthropic-operated infrastructure, so it has no Vertex,
-Bedrock, or Foundry variant. On AWS it is available through
-[Claude Platform on AWS](https://platform.claude.com/docs/en/build-with-claude/claude-platform-on-aws),
-which serves the same `/v1` endpoints with AWS authentication, an `anthropic-workspace-id`
-header, and first-party model ids. The deploy script sends neither; follow the platform
-guide for that route.
-
-## Model ids
-
-The model is a string in the config. Each role config has `model` and `memory_model`; the
-merchant config adds `analysis_model`. The SDK runtimes copy the model into their options,
-and the manifests set it in `agent.yaml`. Nothing else reads the string, so a platform move
-is a config change. Id grammar differs by platform; confirm against your
-platform's catalog.
-
-| Field | Repo default | Anthropic API, gateways | GCP Vertex AI | AWS Bedrock (Mantle) | AWS Bedrock (Invoke API) | Microsoft Foundry |
-|---|---|---|---|---|---|---|
-| Shopping `model` | `claude-sonnet-5` | `claude-sonnet-5` | `claude-sonnet-5` | `anthropic.<SERVED_MODEL>` | `<INFERENCE_PROFILE_ID>` | `claude-sonnet-5` |
-| Merchant `model` | `claude-opus-5` | `claude-opus-5` | `claude-opus-5` | `anthropic.<SERVED_MODEL>` | `<INFERENCE_PROFILE_ID>` | `claude-opus-5` |
-| `memory_model` | `claude-haiku-4-5-20251001` | `claude-haiku-4-5-20251001` | `claude-haiku-4-5@20251001` | `anthropic.<SERVED_MODEL>` | `<INFERENCE_PROFILE_ID>` | `claude-haiku-4-5` |
-
-- Vertex writes dated snapshots with `@`.
-- Bedrock has two endpoints. Mantle speaks the Messages API and takes dateless
-  `anthropic.` ids from its own lineup; the Invoke API takes inference-profile ids from your account's catalog
-  (region-prefixed, dated, `-v1:0` suffixed).
-- Foundry takes the name of a deployment in your resource; the values above are the
-  defaults, which match the dateless first-party ids.
-- Managed Agents takes first-party ids.
-- All three model fields go through the same client, so all three must exist on the
-  platform it targets.
-
-## Messages API runtimes: the `client` argument
-
-`ShoppingAgent` and `MerchantAgent` take an optional `client`. Without one they construct
-`AsyncAnthropic`, which reads `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and
-`ANTHROPIC_BASE_URL` from the environment; exporting the last two points the example APIs
-at a gateway. With one, every call uses it: the turn loop (`messages.stream`), memory
-extraction, and the analysis delegate (`messages.create`). Any async client in the
-`anthropic` package fits. The parameter is annotated `AsyncAnthropic`, so a type checker
-needs a `cast` for the platform classes.
+- no injection: construct the default `AnthropicRuntime`;
+- `runtime=`: use one `ModelRuntime` for the configured main target;
+- `runtimes=`: use a `RuntimeRegistry`, required when main conversation, memory extraction,
+  or Merchant analysis use different providers;
+- `client=`: Anthropic-only v1 compatibility path for existing deployments/tests.
 
 ```python
-from pathlib import Path
-
-from anthropic import (
-    AsyncAnthropic,
-    AsyncAnthropicBedrockMantle,
-    AsyncAnthropicFoundry,
-    AsyncAnthropicVertex,
-)
+from commerce_model_runtime import RuntimeRegistry
+from commerce_model_runtime.providers import AnthropicRuntime
 from shopping_agent import ShoppingAgentConfig
 from shopping_agent_runtime import ShoppingAgent
 
-common = dict(backend=your_backend, skills_dir=Path("shopping-agent/skills"))
+anthropic = AnthropicRuntime(client=your_anthropic_client)
+registry = RuntimeRegistry([anthropic])
 
-# GCP Vertex AI: pip install "anthropic[vertex]"; Application Default Credentials.
 agent = ShoppingAgent(
-    **common,
-    config=ShoppingAgentConfig(memory_model="claude-haiku-4-5@20251001"),
-    client=AsyncAnthropicVertex(project_id="your-project", region="global"),
-)
-
-# AWS Bedrock, Mantle endpoint: the standard AWS credential chain.
-agent = ShoppingAgent(
-    **common,
+    backend=your_backend,
     config=ShoppingAgentConfig(
-        model="anthropic.your-served-model", memory_model="anthropic.claude-haiku-4-5"
+        provider="anthropic",
+        model="claude-sonnet-5",
+        memory_provider="anthropic",
+        memory_model="claude-haiku-4-5-20251001",
     ),
-    client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
-)
-
-# Microsoft Foundry: an Azure API key, or azure_ad_token_provider= for Entra ID.
-agent = ShoppingAgent(
-    **common,
-    config=ShoppingAgentConfig(memory_model="claude-haiku-4-5"),
-    client=AsyncAnthropicFoundry(resource="your-resource", api_key="your-azure-key"),
-)
-
-# In-house gateway: it must serve /v1/messages with SSE streaming.
-agent = ShoppingAgent(
-    **common,
-    client=AsyncAnthropic(base_url="https://llm-gateway.internal.example", auth_token="your-token"),
+    runtimes=registry,
 )
 ```
 
-The packages declare `anthropic>=0.91`, the release that adds `AsyncAnthropicBedrockMantle`,
-the newest of the client classes above.
+Merchant adds `analysis_provider` and `analysis_model`. A field whose provider is `None`
+inherits the main provider. `analysis_model=None` inherits the main model. When a non-
+Anthropic main provider is selected and `memory_provider` is left unset, the untouched
+legacy Claude memory-model default also follows the main model rather than constructing an
+invalid cross-provider target.
 
-## Agent SDK runtimes: the CLI environment
+Runtime capability validation runs before the first model request. Safety/control
+requirements such as function tools and forced tool choice fail configuration rather than
+silently degrading. Optional performance features such as prompt caching or streamed tool
+arguments may degrade explicitly.
 
-The SDK runtimes construct no HTTP client. `claude-agent-sdk` starts the Claude Code CLI,
-and the CLI selects the platform from its environment. `make_options()` returns
-`(options, toolset)`; add the platform variables to `options.env` before opening the client.
-The SDK overlays `env` on the inherited environment, so only the platform variables need
-listing.
+## Anthropic deployments
+
+`AnthropicRuntime` accepts any compatible async Anthropic client, including the first-party
+API, Vertex AI, Bedrock/Mantle, Foundry, and an in-house Messages-compatible gateway.
+Existing `client=` deployments continue to work, but new code should prefer wrapping the
+client in `AnthropicRuntime` and injecting `runtime=` or `runtimes=`.
+
+| Anthropic target | Messages runtime client |
+|---|---|
+| Anthropic API | `AsyncAnthropic` (default) |
+| GCP Vertex AI | `AsyncAnthropicVertex` |
+| AWS Bedrock Mantle | `AsyncAnthropicBedrockMantle` |
+| AWS Bedrock Invoke API | `AsyncAnthropicBedrock` |
+| Microsoft Foundry | `AsyncAnthropicFoundry` |
+| In-house gateway | `AsyncAnthropic(base_url=..., auth_token=...)` |
+
+```python
+from anthropic import AsyncAnthropicVertex
+from commerce_model_runtime.providers import AnthropicRuntime
+from shopping_agent import ShoppingAgentConfig
+from shopping_agent_runtime import ShoppingAgent
+
+runtime = AnthropicRuntime(
+    client=AsyncAnthropicVertex(project_id="your-project", region="global")
+)
+agent = ShoppingAgent(
+    backend=your_backend,
+    config=ShoppingAgentConfig(
+        provider="anthropic",
+        model="claude-sonnet-5",
+        memory_model="claude-haiku-4-5@20251001",
+    ),
+    runtime=runtime,
+)
+```
+
+The default client reads the Anthropic SDK's normal environment configuration, including
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` where applicable.
+The repository root install includes `commerce-model-runtime[anthropic]`; individual
+provider deployments may install only the extras they need as additional adapters land.
+
+### Anthropic model ids
+
+Model ids remain deployment strings and their grammar depends on the platform. The repo
+defaults are `claude-sonnet-5` for Shopping, `claude-opus-5` for Merchant, and
+`claude-haiku-4-5-20251001` for memory. Vertex commonly uses `@`-dated snapshots; Bedrock
+uses the ids required by its selected endpoint; Foundry uses deployment names. Confirm ids
+against the platform catalog.
+
+## Main, memory, and analysis targets
+
+Messages runtimes no longer assume that every operation must share one provider client.
+`RuntimeRegistry` resolves each operation independently:
+
+```text
+Shopping turn  -> config.model_target()
+Memory pass    -> config.memory_target()
+Merchant turn  -> config.model_target()
+Analysis       -> config.analysis_target()
+```
+
+Provider switching never occurs automatically in the middle of a turn. The selected main
+runtime is fixed for that turn. Opaque provider continuation state is passed back only to
+the same provider. Commerce provenance, gates, staged changes, approval marks, and memory
+store state remain provider-independent.
+
+Merchant portable analysis uses ordinary read/query tools through `ModelRuntime.complete()`.
+Hosted code execution is optional and requires the selected analysis runtime/model to
+advertise `hosted_code_execution`; provider container/continuation identifiers remain in
+opaque `ProviderState` and never grant Commerce write authority.
+
+## Claude Agent SDK runtimes
+
+The Agent SDK paths are intentionally not generalized. `claude-agent-sdk` starts the Claude
+Code CLI, and the CLI selects Anthropic/Vertex/Bedrock/Foundry or a compatible gateway from
+its environment.
 
 ```python
 from claude_agent_sdk import ClaudeSDKClient
@@ -137,45 +135,33 @@ from shopping_agent_sdk import make_options
 
 options, toolset = make_options()
 options.env.update({"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"})
-options.model = "us.anthropic.claude-sonnet-5"
 async with ClaudeSDKClient(options=options) as client:
     ...
 ```
 
-| Target | Required | Credentials | Model ids | Optional |
-|---|---|---|---|---|
-| AWS Bedrock, Invoke API | `CLAUDE_CODE_USE_BEDROCK=1` | AWS standard chain | inference-profile ids | `ANTHROPIC_BEDROCK_BASE_URL` |
-| AWS Bedrock, Mantle | `CLAUDE_CODE_USE_MANTLE=1` | AWS standard chain | `anthropic.` ids | `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `CLAUDE_CODE_SKIP_MANTLE_AUTH`⁴ |
-| GCP Vertex AI | `CLAUDE_CODE_USE_VERTEX=1`, `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION` | Application Default Credentials | `@`-dated ids | `ANTHROPIC_VERTEX_BASE_URL` |
-| Microsoft Foundry | `CLAUDE_CODE_USE_FOUNDRY=1`, `ANTHROPIC_FOUNDRY_RESOURCE` or `ANTHROPIC_FOUNDRY_BASE_URL` | `ANTHROPIC_FOUNDRY_API_KEY`, or Entra ID via the Azure default chain | deployment names | `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`⁵ |
-| In-house gateway | `ANTHROPIC_BASE_URL` | `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | first-party ids | `ANTHROPIC_CUSTOM_HEADERS` |
+Common selectors remain `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_MANTLE`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, and `ANTHROPIC_BASE_URL`. See Claude
+Code documentation for the platform-specific credential and model-id variables.
 
-⁴ Set to `1` when a gateway signs the requests. ⁵ Pin the deployment names the CLI uses
-for its Sonnet and Opus calls.
+## Managed Agents
 
-Set `ANTHROPIC_DEFAULT_HAIKU_MODEL` when the platform needs its own id for the CLI's
-small-model calls. These variables belong to Claude Code; its documentation is the
-reference.
+Managed Agents are also unchanged. `scripts/deploy_managed_agent.sh` reads
+`ANTHROPIC_API_KEY` and posts to `ANTHROPIC_API_URL` (default `https://api.anthropic.com`).
+A gateway for this path must proxy the Skills, Agents, Environments, Sessions, and session
+stream APIs, not only `/v1/messages`.
 
-## Managed Agents: the endpoint
+## Tests and verification
 
-`scripts/deploy_managed_agent.sh` reads `ANTHROPIC_API_KEY` and posts to `ANTHROPIC_API_URL`
-(default `https://api.anthropic.com`; the other two paths read `ANTHROPIC_BASE_URL`). A gateway at that address must proxy `/v1/skills` (multipart),
-`/v1/agents`, and, for your host application, `/v1/environments`, `/v1/sessions`, and the
-session event stream, with the `anthropic-beta` headers intact. A gateway that fronts only
-`/v1/messages` does not serve this path.
+The test layers are now split by responsibility:
 
-```bash
-# Dry run against a gateway (the default); add --live to deploy.
-ANTHROPIC_API_URL=https://llm-gateway.internal.example \
-  scripts/deploy_managed_agent.sh shopping-agent/managed-agents/shopping-agent
-```
+1. Commerce safety/business tests remain provider-independent.
+2. Agent-loop behavior can use `commerce_model_runtime.testing.FakeModelRuntime`.
+3. Anthropic request/event wire behavior lives in `commerce-model-runtime/tests/providers`.
+4. Existing `commerce_common.testing.FakeClient` remains as a compatibility re-export of
+   the Anthropic provider fake so the original parity suite can keep running.
+5. Live provider evaluations are separate from normal deterministic CI.
 
-## What the tests cover
-
-`tests/test_platform_seams.py` constructs each platform client with placeholder credentials
-and checks that both Messages API runtimes bind it, and that each environment above reaches
-`ClaudeAgentOptions` in both SDK runtimes. `scripts/verify_all.py` runs both deploy dry
-runs. No test holds cloud credentials, so no live platform conversation runs here; run one
-on your platform before relying on it. To drive either agent with no credentials at all,
-script the model with `commerce_common.testing.FakeClient`.
+`tests/test_platform_seams.py` continues to cover the Anthropic transport/platform clients.
+`tests/test_provider_seams.py` covers the new runtime registry boundary. Run
+`python scripts/verify_all.py` before merging; a deployment should additionally run a live
+conversation against each provider/model it enables.
