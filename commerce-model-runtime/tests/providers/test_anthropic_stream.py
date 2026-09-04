@@ -43,9 +43,12 @@ class FakeStream:
 
     async def __anext__(self):
         try:
-            return next(self._it)
+            event = next(self._it)
         except StopIteration:
             raise StopAsyncIteration
+        if isinstance(event, BaseException):
+            raise event
+        return event
 
     async def get_final_message(self):
         return self.final
@@ -142,6 +145,33 @@ async def test_stream_turns_invalid_json_into_tool_call_failed_without_throwing(
     failed = [e for e in normalized if e.type == "tool_call_failed"]
     assert len(failed) == 1
     assert failed[0].id == "toolu_bad"
+
+
+@pytest.mark.asyncio
+async def test_open_tool_value_error_is_salvaged_as_failed_call_not_stream_failure():
+    events = [
+        NS(type="message_start", message=NS(usage=NS(input_tokens=4, output_tokens=1))),
+        NS(
+            type="content_block_start",
+            index=0,
+            content_block=NS(type="tool_use", id="toolu_bad", name="present_products", input={}),
+        ),
+        NS(
+            type="content_block_delta",
+            index=0,
+            delta=NS(type="input_json_delta", partial_json='{"picks":'),
+        ),
+        ValueError("Anthropic accumulator rejected incomplete tool JSON"),
+    ]
+    final = NS(id="never", stop_reason="tool_use", content=[], usage=NS())
+    runtime = AnthropicRuntime(client=FakeClient(FakeStream(events, final)))
+
+    normalized = [event async for event in runtime.stream(request())]
+
+    assert [event.type for event in normalized][-1] == "tool_call_failed"
+    failed = normalized[-1]
+    assert failed.id == "toolu_bad" and failed.name == "present_products"
+    assert not [event for event in normalized if event.type == "response_completed"]
 
 
 @pytest.mark.asyncio
