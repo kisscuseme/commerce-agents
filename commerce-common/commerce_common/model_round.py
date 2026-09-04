@@ -79,6 +79,11 @@ class ModelRoundRunner:
             malformed_call_ids=frozenset(self._malformed),
         )
 
+    def malformed_input_chars(self, tool_call_id: str) -> int:
+        """Length of buffered malformed arguments, without exposing their contents."""
+        tool = self._tools.get(tool_call_id)
+        return len(tool.buffer) if tool is not None else 0
+
     def _partial_frame(self, tool: _StreamingTool) -> AgentEvent | None:
         if tool.name not in self.partial_tools or tool.name not in self.specs:
             return None
