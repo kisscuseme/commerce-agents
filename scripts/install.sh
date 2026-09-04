@@ -4,7 +4,7 @@
 #
 # Install the repository's packages and their pinned dependencies into the active environment.
 #
-#   ./scripts/install.sh            # requirements.txt: the seven packages plus what they need
+#   ./scripts/install.sh            # requirements.txt: the eight packages plus what they need
 #   ./scripts/install.sh dev        # requirements-dev.txt: the above plus pytest and ruff
 #
 # Runs from any directory, inside a virtualenv (python3 -m venv .venv && source .venv/bin/activate).
