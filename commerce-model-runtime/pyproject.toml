@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "commerce-model-runtime"
+version = "0.1.0.dev0"
+description = "Provider-neutral model request, response, streaming event, and runtime contracts for commerce agents."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+classifiers = ["License :: OSI Approved :: Apache Software License"]
+authors = [{ name = "Anthropic" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.15,<0.17"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["commerce_model_runtime"]
