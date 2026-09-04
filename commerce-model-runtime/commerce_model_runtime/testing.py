@@ -27,7 +27,8 @@ class ScriptedRound:
 class FakeModelRuntime:
     provider = "fake"
 
-    def __init__(self, rounds: Iterable[ScriptedRound]) -> None:
+    def __init__(self, rounds: Iterable[ScriptedRound], *, provider: str = "fake") -> None:
+        self.provider = provider
         self._rounds = list(rounds)
         self.calls: list[ModelRequest] = []
         self.stream_calls: list[ModelRequest] = []
