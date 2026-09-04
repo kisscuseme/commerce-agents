@@ -112,7 +112,21 @@ class ToolResultContent:
     is_error: bool = False
 
 
-ModelContent: TypeAlias = TextContent | ToolCallContent | ToolResultContent
+@dataclass(frozen=True)
+class ProviderOpaqueContent:
+    provider: str
+    data: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        try:
+            json.dumps(self.data)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("provider opaque content data must be JSON-serializable") from exc
+
+
+ModelContent: TypeAlias = (
+    TextContent | ToolCallContent | ToolResultContent | ProviderOpaqueContent
+)
 
 
 @dataclass(frozen=True)
