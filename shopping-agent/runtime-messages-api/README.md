@@ -1,16 +1,21 @@
 # shopping-agent/runtime-messages-api (package `shopping_agent_runtime`)
 
-The shopping agent's turn loop on the Messages API. `ShoppingAgent` builds the static
-prompt and tool array once, and on each turn prefetches the profile, cart, and memory
-facts, streams the model, executes tool calls concurrently through
-`shopping_agent.executor`, and yields events for the host to render. The four example
-APIs are host applications around it (`examples/demo_common/storefront.py`).
+The shopping agent's provider-neutral Messages-style turn loop. `ShoppingAgent` builds
+one semantic prompt/tool surface, resolves a `ModelRuntime`, streams canonical model
+events, executes Commerce tools through `shopping_agent.executor`, and yields the same
+host `AgentEvent` protocol regardless of model provider.
+
+The v1 foundation ships `AnthropicRuntime` as the behavioral reference adapter. OpenAI
+and Gemini adapters are separate follow-on plans. Claude Agent SDK and Managed Agents are
+not routed through this package.
 
 | Module | Holds |
 |---|---|
 | `orchestrator.py` | `ShoppingAgent`: constructor, `stream_turn`, `update_memory` |
 
 ## Use
+
+The backward-compatible default remains Anthropic:
 
 ```python
 from pathlib import Path
@@ -20,48 +25,69 @@ from shopping_agent import ShoppingAgentConfig, ShoppingSessionContext, Shopping
 from shopping_agent_runtime import ShoppingAgent
 
 agent = ShoppingAgent(
-    backend=your_backend,                       # your StorefrontBackend
+    backend=your_backend,
     skills_dir=Path("shopping-agent/skills"),
     config=ShoppingAgentConfig(brand_name="Your Store"),
-    memory_store=your_store,                    # optional; a commerce_common.memory.MemoryStore
-    client=your_client,                         # optional; see docs/deployment.md
+    memory_store=your_store,
 )
 
-state = ShoppingSessionState()                # keep per session: provenance and cart state
+state = ShoppingSessionState()
 session = ShoppingSessionContext(session_id=sid, user_id=uid)
 async for event in agent.stream_turn(messages, session, state):
     send(to_sse(event))
-await agent.update_memory(messages, session)  # after the reply; extraction runs on memory_model
+await agent.update_memory(messages, session)
 ```
 
-`messages` is the conversation so far ending with the user's message; the turn appends
-its assistant messages and tool results in place, so the host stores the list as is. The
-event types are listed in `commerce_common/streaming.py`; `ui` events carry validated,
-enriched payloads, `ui_partial` events carry the same component while its call is still
-streaming, and `cart_update` carries the whole cart after a write. An API or
-stream error propagates out of `stream_turn`; the host catches it and emits an `error` event
-(see `examples/demo_common/host.py`).
+For explicit runtime injection:
 
-## What the runtime adds to the executor
+```python
+from commerce_model_runtime import RuntimeRegistry
+from commerce_model_runtime.providers import AnthropicRuntime
+from shopping_agent import ShoppingAgentConfig
+from shopping_agent_runtime import ShoppingAgent
 
-- When a rule in `shopping_agent.grounding` fires, the first round is pinned to that read
-  tool with `tool_choice`; after `max_tool_iterations` rounds the last round runs without tools.
-- Tool calls dispatch eagerly: a call executes the moment its content block closes, while
-  the model writes the rest of the round (`eager_tool_dispatch`). Each model call carries a
-  cache breakpoint on the newest persisted message (`rolling_conversation_cache`), placed on
-  the outgoing request only, and sends thinking at `thinking_effort`. `eager_partial_frames`
-  switches `ui_partial` frames from structural changes to every visible change; a call's
-  `status` line goes out as the `tool_call` event's `label`.
-- With `close_on_presentation` on, a round that `round_closes_turn`
-  (`commerce_common/turn.py`) accepts ends the turn there, so `messages` can end on tool
-  results.
-- `extra_presentation_tools` appends a deployment's `PresentationExtension`s to the tool array.
-- `agent.memory` is the deployment's `MemoryRuntime`; a host with its own memory routes
-  reads and deletes through `agent.memory.store`.
+anthropic = AnthropicRuntime(client=your_anthropic_client)
+registry = RuntimeRegistry([anthropic])
 
-The gates themselves (fencing, provenance, caps, memory validation) are in
+agent = ShoppingAgent(
+    backend=your_backend,
+    config=ShoppingAgentConfig(
+        provider="anthropic",
+        model="claude-sonnet-5",
+        memory_provider="anthropic",
+    ),
+    runtimes=registry,
+)
+```
+
+`runtime=` injects one runtime. `runtimes=` injects a registry and is the preferred form
+when conversation and memory may use different providers. `client=` remains an Anthropic-
+only v1 compatibility path and is not the new provider abstraction.
+
+`messages` remains the mutable host conversation. The turn appends assistant messages and
+tool results in place. Provider SDK objects and raw SSE events do not escape the adapter;
+`ui`, `ui_partial`, `cart_update`, `tool_call`, `tool_result`, and `turn_complete` keep their
+existing host shapes.
+
+## Runtime behavior
+
+- Grounding still forces the configured read tool on the first round when a grounding rule
+  fires; the final iteration still forces text-only output.
+- Commerce tools execute through the existing executor/gates. A provider adapter never
+  executes a cart or backend action directly.
+- Eager dispatch starts only after canonical tool arguments are complete. Progressive UI
+  uses canonical argument deltas when the selected runtime supports them; otherwise only
+  the final component is required.
+- Cache and reasoning settings are semantic intents. `AnthropicRuntime` maps them to the
+  Anthropic wire format; other adapters own their own mapping.
+- Malformed streamed tool input is returned to the model as a tool error and is logged by
+  size only, never with the malformed input text.
+- `agent.memory` remains the deployment's `MemoryRuntime`; post-turn extraction resolves
+  `config.memory_target()` independently from the conversation target.
+
+The safety gates themselves (fencing, provenance, cart caps, memory validation) remain in
 `shopping_agent` and `commerce_common`; [`docs/safety.md`](../../docs/safety.md) lists them.
 
-Credentials: the default client reads `ANTHROPIC_API_KEY` (or a token and base URL) from
-the environment. Tests run without any: `pytest shopping-agent/runtime-messages-api/tests`
-scripts the model with `commerce_common.testing.FakeClient`.
+Credentials for the default adapter are still the Anthropic SDK's environment variables.
+Tests can use the compatibility `commerce_common.testing.FakeClient` or, for new provider-
+neutral tests, `commerce_model_runtime.testing.FakeModelRuntime`.
