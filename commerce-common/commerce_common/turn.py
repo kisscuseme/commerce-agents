@@ -95,6 +95,16 @@ def session_tag(session_id: str | None) -> str:
     return hashlib.sha256(session_id.encode()).hexdigest()[:12] if session_id else "-"
 
 
+def usage_totals() -> dict[str, int]:
+    """Legacy host-facing usage accumulator; provider normalization lives elsewhere."""
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
 def compact_history(
     messages: list[dict[str, Any]], last_prompt_tokens: int, max_tokens: int, session_id: str
 ) -> int:
