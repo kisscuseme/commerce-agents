@@ -133,11 +133,12 @@ class MerchantAgent:
 
         self.extra_presentation_tools = tuple(extra_presentation_tools)
         self.extra_delegates = tuple(extra_delegates)
-        built_in = (
-            [build_analysis_delegate(self.client, self.backend, self.config)]
-            if self.config.enable_analysis
-            else []
-        )
+        if self.config.enable_analysis:
+            analysis_target = self.config.analysis_target()
+            analysis_runtime = self.runtimes.resolve(analysis_target)
+            built_in = [build_analysis_delegate(analysis_runtime, self.backend, self.config)]
+        else:
+            built_in = []
         self.delegates: tuple[DelegateExtension, ...] = (*built_in, *self.extra_delegates)
         self._specs: dict[str, PresentationComponent] = {
             **PRESENTATION_COMPONENTS,
