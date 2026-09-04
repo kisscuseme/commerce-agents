@@ -127,10 +127,22 @@ class AnthropicRuntime:
                 tools.append(mapped)
                 continue
             if tool.kind == "web_search":
-                tools.append({"type": _WEB_SEARCH_TYPE, "name": "web_search", **tool.options})
+                tools.append(
+                    {
+                        "type": _WEB_SEARCH_TYPE,
+                        "name": "web_search",
+                        **tool.options,
+                    }
+                )
                 continue
             if tool.kind == "code_execution":
-                tools.append({"type": _CODE_EXECUTION_TYPE, "name": "code_execution", **tool.options})
+                tools.append(
+                    {
+                        "type": _CODE_EXECUTION_TYPE,
+                        "name": "code_execution",
+                        **tool.options,
+                    }
+                )
                 continue
             raise ValueError(f"unsupported Anthropic built-in tool kind: {tool.kind}")
         if tools and request.cache and request.cache.enabled:
@@ -149,7 +161,12 @@ class AnthropicRuntime:
                     provider_id = block.provider_tool_call_id or block.id
                     provider_ids[block.id] = provider_id
                     content.append(
-                        {"type": "tool_use", "id": provider_id, "name": block.name, "input": block.arguments}
+                        {
+                            "type": "tool_use",
+                            "id": provider_id,
+                            "name": block.name,
+                            "input": block.arguments,
+                        }
                     )
                 elif isinstance(block, ToolResultContent):
                     content.append(
@@ -166,7 +183,7 @@ class AnthropicRuntime:
                             f"cannot send {block.provider!r} opaque content through AnthropicRuntime"
                         )
                     content.append(dict(block.data))
-                else:  # pragma: no cover
+                else:  # pragma: no cover - union is closed, defensive for extensions
                     raise TypeError(f"unsupported model content: {type(block).__name__}")
             mapped_messages.append({"role": message.role, "content": content})
 
@@ -180,7 +197,10 @@ class AnthropicRuntime:
             last = mapped_messages[-1]
             if last["content"]:
                 last_content = list(last["content"])
-                last_content[-1] = {**last_content[-1], "cache_control": {"type": "ephemeral"}}
+                last_content[-1] = {
+                    **last_content[-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
                 mapped_messages[-1] = {**last, "content": last_content}
         return mapped_messages
 
@@ -225,7 +245,9 @@ class AnthropicRuntime:
         input_tokens = _get(raw, "input_tokens")
         output_tokens = _get(raw, "output_tokens")
         cached_input = _get(raw, "cache_read_input_tokens")
-        total = input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None
+        total = None
+        if input_tokens is not None and output_tokens is not None:
+            total = input_tokens + output_tokens
         return ModelUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -271,7 +293,9 @@ class AnthropicRuntime:
             stop_reason=self._stop_reason(_get(raw, "stop_reason")),
             usage=self._usage(_get(raw, "usage")),
             provider_state=(
-                ProviderState(self.provider, {"container": container_id}) if container_id else None
+                ProviderState(self.provider, {"container": container_id})
+                if container_id
+                else None
             ),
             provider_request_id=_get(raw, "id"),
         )
@@ -315,6 +339,7 @@ class AnthropicRuntime:
                                 "id": str(_get(block, "id", "")),
                                 "name": str(_get(block, "name", "")),
                                 "parts": [],
+                                "open": True,
                             }
                             tools[index] = tool
                             emitted = True
@@ -340,6 +365,7 @@ class AnthropicRuntime:
                         index = int(_get(raw, "index", 0))
                         tool = tools.get(index)
                         if tool is not None:
+                            tool["open"] = False
                             raw_json = "".join(tool["parts"])
                             try:
                                 arguments = json.loads(raw_json or "{}")
@@ -371,6 +397,25 @@ class AnthropicRuntime:
                 yield ResponseCompleted(self._response(final))
         except ModelRuntimeError:
             raise
+        except ValueError as error:
+            open_tools = [tool for tool in tools.values() if tool.get("open")]
+            if open_tools:
+                for tool in open_tools:
+                    yield ToolCallFailed(
+                        id=tool["id"],
+                        name=tool["name"],
+                        reason="tool input was not valid JSON",
+                        provider_tool_call_id=tool["id"],
+                    )
+                return
+            if emitted:
+                raise StreamInterruptedError(
+                    str(error),
+                    provider=self.provider,
+                    model=request.target.model,
+                    provider_request_id=_get(error, "request_id"),
+                ) from error
+            raise self._normalize_error(error, request) from error
         except Exception as error:
             if emitted:
                 raise StreamInterruptedError(
