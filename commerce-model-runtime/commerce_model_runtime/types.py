@@ -54,6 +54,7 @@ class ReasoningEffort(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    XHIGH = "xhigh"
     MAX = "max"
 
 
@@ -124,9 +125,7 @@ class ProviderOpaqueContent:
             raise TypeError("provider opaque content data must be JSON-serializable") from exc
 
 
-ModelContent: TypeAlias = (
-    TextContent | ToolCallContent | ToolResultContent | ProviderOpaqueContent
-)
+ModelContent: TypeAlias = TextContent | ToolCallContent | ToolResultContent | ProviderOpaqueContent
 
 
 @dataclass(frozen=True)
