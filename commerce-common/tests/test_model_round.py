@@ -94,7 +94,7 @@ async def test_dispatch_starts_only_when_tool_call_is_completed():
 
 
 @pytest.mark.asyncio
-async def test_failed_tool_call_is_settled_without_execution():
+async def test_failed_tool_call_is_settled_without_execution_and_marks_round_abandoned():
     calls = []
 
     async def execute(name, args):
@@ -112,6 +112,31 @@ async def test_failed_tool_call_is_settled_without_execution():
     assert calls == []
     assert outcomes[0].is_error and outcomes[0].result_text == UNREADABLE_INPUT_TEXT
     assert runner.result.malformed_call_ids == frozenset({"bad"})
+    assert runner.result.stop_reason is StopReason.ABANDONED
+
+
+@pytest.mark.asyncio
+async def test_final_response_overrides_abandoned_marker_for_recoverable_malformed_call():
+    runner = ModelRoundRunner()
+
+    async def execute(name, args):
+        return ToolOutcome("unused")
+
+    dispatcher = EagerDispatcher(execute, enabled=True)
+    response = ModelResponse(
+        message=ModelMessage(role="assistant", content=[]),
+        stop_reason=StopReason.TOOL_USE,
+    )
+    await collect(
+        runner,
+        [
+            ToolCallStarted("bad", "search"),
+            ToolCallFailed("bad", "search", "bad json"),
+            ResponseCompleted(response),
+        ],
+        dispatcher,
+    )
+    assert runner.result.stop_reason is StopReason.TOOL_USE
 
 
 @pytest.mark.asyncio
