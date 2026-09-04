@@ -40,8 +40,8 @@ class UnsupportedCapabilityError(ModelRuntimeError):
     pass
 
 
-class ProviderProtocolError(ModelRuntimeError):
-    pass
+class ProviderProtocolError(ModelRuntimeError, ValueError):
+    """Malformed provider/client protocol data; also a ValueError for v1 compatibility."""
 
 
 class StreamInterruptedError(ModelRuntimeError):
