@@ -12,6 +12,7 @@ from commerce_model_runtime import (
     ProviderState,
     ResponseCompleted,
     StopReason,
+    TextContent,
     TextDelta,
     ToolArgumentsDelta,
     ToolCallCompleted,
@@ -54,14 +55,23 @@ class ModelRoundRunner:
     _tool_calls: list[ToolCallContent] = field(default_factory=list, init=False)
     _malformed: set[str] = field(default_factory=set, init=False)
     _message: ModelMessage | None = field(default=None, init=False)
+    _text_parts: list[str] = field(default_factory=list, init=False)
     _stop_reason: StopReason = field(default=StopReason.UNKNOWN, init=False)
     _usage: ModelUsage = field(default_factory=ModelUsage, init=False)
     _provider_state: ProviderState | None = field(default=None, init=False)
 
     @property
     def result(self) -> ModelRoundResult:
+        message = self._message
+        if message is None:
+            content = []
+            if self._text_parts:
+                content.append(TextContent("".join(self._text_parts)))
+            content.extend(self._tool_calls)
+            if content:
+                message = ModelMessage(role="assistant", content=content)
         return ModelRoundResult(
-            message=self._message,
+            message=message,
             tool_calls=tuple(self._tool_calls),
             stop_reason=self._stop_reason,
             usage=self._usage,
@@ -92,6 +102,7 @@ class ModelRoundRunner:
         async for event in events:
             if isinstance(event, TextDelta):
                 if event.text:
+                    self._text_parts.append(event.text)
                     yield AgentEvent.text_delta(event.text)
                 continue
 
@@ -143,3 +154,29 @@ class ModelRoundRunner:
                 self._stop_reason = response.stop_reason
                 self._usage = response.usage
                 self._provider_state = response.provider_state
+
+
+def host_usage_totals() -> dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def accumulate_model_usage(totals: dict[str, int], usage: ModelUsage) -> None:
+    totals["input_tokens"] += usage.input_tokens or 0
+    totals["output_tokens"] += usage.output_tokens or 0
+    totals["cache_read_input_tokens"] += usage.cached_input_tokens or 0
+    totals["cache_creation_input_tokens"] += int(
+        usage.provider_details.get("cache_creation_input_tokens") or 0
+    )
+
+
+def model_prompt_tokens(usage: ModelUsage) -> int:
+    return (
+        (usage.input_tokens or 0)
+        + (usage.cached_input_tokens or 0)
+        + int(usage.provider_details.get("cache_creation_input_tokens") or 0)
+    )
