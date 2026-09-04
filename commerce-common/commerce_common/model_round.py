@@ -134,6 +134,7 @@ class ModelRoundRunner:
 
             if isinstance(event, ToolCallFailed):
                 self._malformed.add(event.id)
+                self._stop_reason = StopReason.ABANDONED
                 call = ToolCallContent(
                     id=event.id,
                     name=event.name,
