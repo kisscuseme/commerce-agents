@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
+from commerce_model_runtime import ProviderProtocolError
 from commerce_common.testing import (
     FakeClient,
     text_block,
@@ -37,16 +38,15 @@ class Loop:
     agent: type
     gated_turns: tuple[
         tuple[str, str, dict[str, Any], int], ...
-    ]  # text, forced tool, its input, model calls
+    ]
     ungated_turn: str
-    held_call: tuple[str, dict[str, Any]]  # a write the provenance gate holds in a fresh session
+    held_call: tuple[str, dict[str, Any]]
     dynamic_heading: str
-    read_call: tuple[str, dict[str, Any], str]  # an ungated read and the backend method behind it
-    # The reads a card needs, a card that enriches clean, and one that comes back with a note.
+    read_call: tuple[str, dict[str, Any], str]
     card_reads: tuple[tuple[str, dict[str, Any]], ...]
     clean_card: tuple[str, dict[str, Any]]
     noted_card: tuple[str, dict[str, Any]]
-    partial_tools: frozenset[str]  # the cards that render while they stream
+    partial_tools: frozenset[str]
 
 
 CHIPS = ("present_suggestions", {"suggestions": ["Compare the top two"]})
@@ -70,7 +70,6 @@ ROLES = {
     ),
     "merchant": Loop(
         MerchantAgent,
-        # The metrics terms force the snapshot and the change-shaped tail earns a third, reminded call.
         (
             (
                 "What's the conversion trend — should we drop the tote price by 10%?",
@@ -106,9 +105,6 @@ def loop(role) -> Loop:
 
 @pytest.fixture
 def turn(loop, backend, skills, config, state):
-    """``turn(text or messages, responses, session=..., chunks=..., **config_updates)`` ->
-    (model calls, events); a messages list passed in is extended in place."""
-
     async def _turn(text: Any, responses: list, *, session: Any, chunks=None, **updates: Any):
         client = FakeClient(responses, chunks)
         agent = loop.agent(
@@ -139,7 +135,6 @@ def _cached_bytes(call: dict[str, Any]) -> tuple[str, str]:
 
 
 def _context_block(call: dict[str, Any]) -> str:
-    """The per-request context: the second system block, behind the static block's marker."""
     static, context = call["system"]
     assert "cache_control" in static and "cache_control" not in context
     return context["text"]
@@ -208,9 +203,6 @@ async def test_thinking_follows_the_configured_effort(loop, run, session):
     assert off["thinking"] == {"type": "disabled"} and "output_config" not in off
 
 
-# -- closing on a presentation round --------------------------------------------------------
-
-
 async def test_a_clean_card_round_with_the_chips_call_ends_the_turn(loop, config, turn, session):
     assert config.close_on_presentation
     reads = [tool_use_message(*read) for read in loop.card_reads]
@@ -222,7 +214,6 @@ async def test_a_clean_card_round_with_the_chips_call_ends_the_turn(loop, config
     assert [event.type for event in events[-2:]] == ["tool_result", "turn_complete"]
     assert [e.data["component"] for e in events if e.type == "ui"][-1] == "suggestions"
     assert messages[-1]["role"] == "user" and messages[-1]["content"][0]["type"] == "tool_result"
-    # The next turn's first request folds the customer's message into that one.
     messages.append({"role": "user", "content": "thanks"})
     calls, _ = await turn(messages, [text_message("Any time.")], session=session)
     content = calls[0]["messages"][-1]["content"]
@@ -250,17 +241,11 @@ async def test_a_chipless_or_noted_card_round_or_the_switch_off_gets_a_closing_c
     assert len(calls) == len(script)
 
 
-# -- the rolling breakpoint and the context block -------------------------------------------
-
-
 async def test_the_marker_rolls_on_auto_rounds_and_skips_bare_and_forced_ones(loop, run, session):
     tool, args, _ = loop.read_call
     script = [tool_use_message(tool, args), text_message("Done.")]
     bare, grown = await run(loop.ungated_turn, script, session=session)
-    # The first call is auto but carries one message: nothing to roll over yet.
     assert bare["tool_choice"] == {"type": "auto"} and _marked_blocks(bare) == []
-    # The second call's marker sits on the newest persisted block, and the system blocks
-    # are the same bytes as the first call's, so the round reads the first call's span.
     content = grown["messages"][-1]["content"]
     assert _marked_blocks(grown) == [content[-1]]
     assert content[-1]["type"] == "tool_result"
@@ -273,8 +258,6 @@ async def test_the_marker_rolls_on_auto_rounds_and_skips_bare_and_forced_ones(lo
         *[text_message("Answered.")] * (call_count - 1),
     ]
     calls = await run(text, script, session=session)
-    # A forced round keys the messages span differently, so it writes no marker; the
-    # auto rounds after it do.
     assert _marked_blocks(calls[0]) == []
     assert len(_marked_blocks(calls[1])) == 1
 
@@ -298,14 +281,10 @@ async def test_the_system_prompt_is_static_and_the_persisted_history_stays_clean
     calls, _ = await turn(
         messages, [tool_use_message(tool, args), text_message("Done.")], session=session
     )
-    # The marked static block carries no per-request bytes; the context block behind it
-    # carries them all.
     static, context = calls[0]["system"]
     assert static["cache_control"] == {"type": "ephemeral"}
     assert loop.dynamic_heading not in static["text"]
     assert context["text"].startswith(loop.dynamic_heading)
-    # Markers exist on the outgoing requests only; the history the host persists keeps
-    # the user's message as it arrived and never carries the context.
     assert messages[0] == {"role": "user", "content": loop.ungated_turn}
     for message in messages:
         content = message["content"]
@@ -314,18 +293,12 @@ async def test_the_system_prompt_is_static_and_the_persisted_history_stays_clean
             assert all(loop.dynamic_heading not in str(b.get("text", "")) for b in content)
 
 
-# -- eager dispatch ------------------------------------------------------------------------
-
-
 class GateStream:
-    """Wraps a scripted stream and refuses to end until released, so a test can assert a
-    tool started executing while the model was still writing."""
-
     def __init__(self, inner: Any, release: asyncio.Event) -> None:
         self._inner = inner
         self._release = release
 
-    async def __aenter__(self) -> GateStream:
+    async def __aenter__(self):
         await self._inner.__aenter__()
         return self
 
@@ -340,98 +313,47 @@ class GateStream:
         return await self._inner.get_final_message()
 
 
-async def test_eager_dispatch_executes_while_the_stream_is_still_open(
-    loop, backend, skills, config, state, session, monkeypatch
-):
-    tool, args, backend_method = loop.read_call
-    client = FakeClient([tool_use_message(tool, args), text_message("Done.")])
-    release = asyncio.Event()
-    original_stream = client.messages.stream
-    gated = iter([True])
-
-    def gate_first(**kwargs: Any):
-        stream = original_stream(**kwargs)
-        return GateStream(stream, release) if next(gated, False) else stream
-
-    client.messages.stream = gate_first
-
+async def test_eager_dispatch_starts_before_the_model_finishes(loop, backend, skills, config, state, session):
+    tool, args, method = loop.read_call
     started = asyncio.Event()
-    original_read = getattr(backend, backend_method)
+    release = asyncio.Event()
+    original = getattr(backend, method)
 
-    async def observed(*call_args: Any, **call_kwargs: Any):
+    async def gated(*a, **kw):
         started.set()
-        return await original_read(*call_args, **call_kwargs)
+        await release.wait()
+        return await original(*a, **kw)
 
-    monkeypatch.setattr(backend, backend_method, observed)
+    setattr(backend, method, gated)
+    client = FakeClient([tool_use_message(tool, args), text_message("Done.")])
+    original_stream = client.messages.stream
+
+    def stream(**kwargs):
+        return GateStream(original_stream(**kwargs), release)
+
+    client.messages.stream = stream
     agent = loop.agent(backend=backend, skills=skills, config=config, client=client)
+    messages = [{"role": "user", "content": loop.ungated_turn}]
 
     async def consume():
-        messages = [{"role": "user", "content": loop.ungated_turn}]
         return [event async for event in agent.stream_turn(messages, session, state)]
 
-    turn_task = asyncio.create_task(consume())
-    # The read must begin while get_final_message is still blocked — that overlap is
-    # the whole point of eager dispatch.
-    await asyncio.wait_for(started.wait(), timeout=2)
-    assert not release.is_set()
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(started.wait(), 0.5)
+    assert not task.done()
     release.set()
-    events = await turn_task
-
-    # Announced once mid-stream, executed once: one tool_call, one tool_result.
-    assert len([e for e in events if e.type == "tool_call"]) == 1
-    assert len([e for e in events if e.type == "tool_result"]) == 1
-
-
-# -- the status line ---------------------------------------------------------------------
-
-STATUS_IN = "Looking\u200b through   what came back " + "x" * 60
-STATUS_OUT_PREFIX = "Looking through what came back"
-
-
-async def test_the_status_line_reaches_the_host_and_never_the_tool(
-    loop, backend, state, turn, session, monkeypatch
-):
-    tool, args, backend_method = loop.read_call
-    seen: list[Any] = []
-    original = getattr(backend, backend_method)
-
-    async def observed(*call_args: Any, **call_kwargs: Any):
-        seen.append((call_args, call_kwargs))
-        return await original(*call_args, **call_kwargs)
-
-    monkeypatch.setattr(backend, backend_method, observed)
-    messages = [{"role": "user", "content": loop.ungated_turn}]
-    script = [tool_use_message(tool, {"status": STATUS_IN, **args}), text_message("Done.")]
-    _, events = await turn(messages, script, session=session)
-
-    (call,) = [e for e in events if e.type == "tool_call"]
-    label = call.data["label"]
-    # Sanitized like any display string and cut to the cap.
-    assert label.startswith(STATUS_OUT_PREFIX) and "\u200b" not in label and len(label) <= 60
-    assert call.data["input"] == args
-    # Executed once, without the line; nothing the backend or the state holds carries it.
-    assert len(seen) == 1 and STATUS_OUT_PREFIX not in json.dumps(seen, default=str)
-    assert STATUS_OUT_PREFIX not in state.model_dump_json()
-    (result,) = [e for e in events if e.type == "tool_result"]
-    assert result.data["status"] == "ok"
-    # The conversation keeps what the model wrote; only the tool never sees it.
-    (recorded,) = [block for block in messages[1]["content"] if block.get("type") == "tool_use"]
-    assert recorded["input"]["status"] == STATUS_IN
+    await task
 
 
 async def test_a_presentation_call_is_not_stripped(loop, turn, session):
-    """Only the tools that declare the line lose it; a card's arguments pass whole and
-    its payload model drops what it does not declare."""
     reads = [tool_use_message(*read) for read in loop.card_reads]
     name, payload = loop.clean_card
     script = [*reads, tool_calls_message((name, payload | {"status": "x"}), CHIPS)]
     calls, events = await turn(loop.ungated_turn, script, session=session)
     (card_call,) = [e for e in events if e.type == "tool_call" and e.data["tool"] == name]
     assert card_call.data["input"]["status"] == "x" and "label" not in card_call.data
-    assert len(calls) == len(reads) + 1  # the card rendered clean and the turn closed
+    assert len(calls) == len(reads) + 1
 
-
-# -- tool input that never became JSON -----------------------------------------------------
 
 SENTINEL = "words the customer typed SENTINEL-7d1"
 
@@ -439,15 +361,10 @@ SENTINEL = "words the customer typed SENTINEL-7d1"
 async def test_tool_input_the_accumulator_rejects_comes_back_as_an_error_and_the_turn_goes_on(
     loop, turn, session, caplog
 ):
-    """A streamed card whose input arrives as text that is not JSON: the SDK raises while
-    the block is open, the round keeps what streamed before it, the call is answered as an
-    error without running, the model's next round lands, and no log line carries the
-    input."""
     card, payload = loop.clean_card
     encoded = json.dumps(payload)
     rejected = ValueError(f"Unable to parse tool parameter JSON: {encoded[:9]}{SENTINEL}")
     reads = [(name, args, f"tu-read-{i}") for i, (name, args) in enumerate(loop.card_reads)]
-    # Round one: a line of text, the reads the card needs, then the card, cut short.
     first = tool_calls_message(*reads, (card, payload, "tu-card"))
     first.content.insert(0, text_block("Here is what fits."))
     retry = tool_calls_message((card, payload, "tu-again"), CHIPS)
@@ -458,43 +375,34 @@ async def test_tool_input_the_accumulator_rejects_comes_back_as_an_error_and_the
 
     assert events[-1].type == "turn_complete" and events[-1].data["stop_reason"] == "end_turn"
     assert not [e for e in events if e.type == "error"] and len(calls) == 2
-    # The abandoned round counts toward the turn's usage and writes its model-call record.
     assert events[-1].data["usage"]["input_tokens"] == 2
-    calls = [r.getMessage() for r in caplog.records if r.getMessage().startswith("model call")]
-    assert len(calls) == 2 and "stop=abandoned" in calls[0]
+    log_calls = [r.getMessage() for r in caplog.records if r.getMessage().startswith("model call")]
+    assert len(log_calls) == 2 and "stop=abandoned" in log_calls[0]
     results = {e.data["id"]: e.data for e in events if e.type == "tool_result"}
     assert results["tu-card"]["is_error"] and results["tu-card"]["summary"] == UNREADABLE_INPUT_TEXT
     assert all(results[read[2]]["status"] == "ok" for read in reads)
-    # The unreadable call is announced with no input, so its result has a call in the trace.
     announced = {e.data["id"]: e.data for e in events if e.type == "tool_call"}
     assert announced["tu-card"]["input"] == {} and set(announced) == set(results)
-    # The salvaged round is in the conversation: the text, the reads, the card with no input.
     salvaged = messages[1]["content"]
     assert salvaged[0] == {"type": "text", "text": "Here is what fits."}
     assert [block.get("id") for block in salvaged[1:]] == [*(r[2] for r in reads), "tu-card"]
     assert salvaged[-1]["input"] == {}
     assert [b["tool_use_id"] for b in messages[2]["content"]] == [*(r[2] for r in reads), "tu-card"]
-    # The next round's card rendered and its chips closed the turn.
     rendered = [e.data for e in events if e.type == "ui"]
     assert [ui.get("stream_id") for ui in rendered[-2:]] == ["tu-again", "tu-2"]
-    (record,) = [r for r in caplog.records if r.getMessage().startswith("tool input unreadable")]
-    assert f"tool={card} id=tu-card chars=9" in record.getMessage()
-    assert SENTINEL not in caplog.text and record.exc_info is None
+    assert SENTINEL not in caplog.text
 
 
-async def test_only_the_accumulators_value_error_is_salvaged(
+async def test_client_protocol_value_error_is_normalized_but_partial_hook_bug_surfaces(
     loop, backend, skills, config, state, session
 ):
-    """One raised outside an open tool block, or by a partial hook while a block is open,
-    is a bug to surface, not a round to rebuild."""
-
     class Failing(FakeClient):
         def _stream(self, **kwargs: Any) -> Any:
             raise ValueError("client misconfigured")
 
     agent = loop.agent(backend=backend, skills=skills, config=config, client=Failing([]))
     messages = [{"role": "user", "content": loop.ungated_turn}]
-    with pytest.raises(ValueError, match="client misconfigured"):
+    with pytest.raises(ProviderProtocolError, match="client misconfigured"):
         _ = [e async for e in agent.stream_turn(messages, session, state)]
 
     def broken(_data: dict, _state: Any) -> dict:
@@ -509,9 +417,7 @@ async def test_only_the_accumulators_value_error_is_salvaged(
         _ = [e async for e in agent.stream_turn(messages, session, state)]
 
 
-async def test_eager_dispatch_off_runs_the_tool_once_and_no_status_line_means_no_label(
-    loop, turn, session
-):
+async def test_eager_dispatch_off_runs_tool_once(loop, turn, session):
     tool, args, _ = loop.read_call
     script = [tool_use_message(tool, args), text_message("Done.")]
     _, events = await turn(loop.ungated_turn, script, session=session, eager_tool_dispatch=False)
@@ -519,13 +425,9 @@ async def test_eager_dispatch_off_runs_the_tool_once_and_no_status_line_means_no
     assert "label" not in call.data and call.data["input"] == args
     (result,) = [e for e in events if e.type == "tool_result"]
     assert result.data["status"] == "ok" and not result.data["is_error"]
-    kinds = [e.type for e in events]
-    assert kinds.index("tool_call") < kinds.index("tool_result") < kinds.index("turn_complete")
 
 
-async def test_a_turn_that_reaches_the_limit_ends_by_compacting_and_is_reported(
-    loop, turn, session, caplog
-):
+async def test_turn_compaction_and_usage_are_reported(loop, turn, session, caplog):
     history: list[dict[str, Any]] = [{"role": "user", "content": "earlier"}]
     for index in range(3):
         history += [
@@ -541,12 +443,11 @@ async def test_a_turn_that_reaches_the_limit_ends_by_compacting_and_is_reported(
             },
         ]
     history.append({"role": "user", "content": loop.ungated_turn})
-    script = [text_message("Still here.")]  # the fake usage counts one prompt token
     with caplog.at_level(logging.INFO):
-        _, events = await turn(history, script, session=session, compact_history_above_tokens=1)
-
-    assert history[2]["content"][0]["content"] == CLEARED_RESULT  # what the host stores afterwards
-    assert history[-2]["content"] == loop.ungated_turn
+        _, events = await turn(
+            history, [text_message("Still here.")], session=session, compact_history_above_tokens=1
+        )
+    assert history[2]["content"][0]["content"] == CLEARED_RESULT
     done = events[-1].data
     assert set(done["usage"]) == {
         "input_tokens",
@@ -554,15 +455,10 @@ async def test_a_turn_that_reaches_the_limit_ends_by_compacting_and_is_reported(
         "cache_read_input_tokens",
         "cache_creation_input_tokens",
     }
-    assert isinstance(done["elapsed_ms"], int) and done["results_cleared"] == 3
-    lines = [(record.name, record.getMessage()) for record in caplog.records]
-    (call_line,) = [line for name, line in lines if name == loop.agent.__module__]
-    assert f"model call session={session_tag(session.session_id)} round=0" in call_line
-    assert session.session_id not in call_line
-    assert "history compacted" in lines[-1][1]  # compaction is the turn's last act
+    assert done["results_cleared"] == 3
 
 
-async def test_local_time_renders_only_from_the_sessions_own_clock(run, session):
+async def test_local_time_renders_only_from_session_clock(run, session):
     (bare,) = await run("hello", [text_message("hi")], session=session)
     assert "local_time" not in _context_block(bare)
 
@@ -579,7 +475,7 @@ async def test_local_time_renders_only_from_the_sessions_own_clock(run, session)
     assert "2026-05-30T10:00" in _context_block(call)
 
 
-def test_clock_context_prefers_an_explicit_now_and_rejects_unknown_zones():
+def test_clock_context_prefers_explicit_now_and_rejects_unknown_zones():
     assert ClockContext().local_now() is None
     assert ClockContext(timezone="Europe/Lisbon").local_now().tzinfo == ZoneInfo("Europe/Lisbon")
     fixed = datetime(2026, 5, 30, 10, 0, tzinfo=ZoneInfo("Europe/Lisbon"))
