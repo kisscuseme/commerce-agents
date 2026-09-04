@@ -34,6 +34,8 @@ from ..types import (
     ModelResponse,
     ModelTarget,
     ModelUsage,
+    ProviderOpaqueContent,
+    ProviderState,
     ReasoningEffort,
     SegmentStability,
     StopReason,
@@ -55,6 +57,16 @@ def _get(value: Any, name: str, default: Any = None) -> Any:
 
 def _non_none(mapping: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in mapping.items() if value is not None}
+
+
+def _plain(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "model_dump"):
+        return dict(value.model_dump(exclude_none=True, exclude={"citations"}))
+    if hasattr(value, "__dict__"):
+        return {key: item for key, item in vars(value).items() if item is not None}
+    raise TypeError(f"cannot convert provider block {type(value).__name__} to a mapping")
 
 
 class AnthropicRuntime:
@@ -115,22 +127,10 @@ class AnthropicRuntime:
                 tools.append(mapped)
                 continue
             if tool.kind == "web_search":
-                tools.append(
-                    {
-                        "type": _WEB_SEARCH_TYPE,
-                        "name": "web_search",
-                        **tool.options,
-                    }
-                )
+                tools.append({"type": _WEB_SEARCH_TYPE, "name": "web_search", **tool.options})
                 continue
             if tool.kind == "code_execution":
-                tools.append(
-                    {
-                        "type": _CODE_EXECUTION_TYPE,
-                        "name": "code_execution",
-                        **tool.options,
-                    }
-                )
+                tools.append({"type": _CODE_EXECUTION_TYPE, "name": "code_execution", **tool.options})
                 continue
             raise ValueError(f"unsupported Anthropic built-in tool kind: {tool.kind}")
         if tools and request.cache and request.cache.enabled:
@@ -149,12 +149,7 @@ class AnthropicRuntime:
                     provider_id = block.provider_tool_call_id or block.id
                     provider_ids[block.id] = provider_id
                     content.append(
-                        {
-                            "type": "tool_use",
-                            "id": provider_id,
-                            "name": block.name,
-                            "input": block.arguments,
-                        }
+                        {"type": "tool_use", "id": provider_id, "name": block.name, "input": block.arguments}
                     )
                 elif isinstance(block, ToolResultContent):
                     content.append(
@@ -165,7 +160,13 @@ class AnthropicRuntime:
                             **({"is_error": True} if block.is_error else {}),
                         }
                     )
-                else:  # pragma: no cover - union is closed, defensive for extensions
+                elif isinstance(block, ProviderOpaqueContent):
+                    if block.provider != self.provider:
+                        raise ValueError(
+                            f"cannot send {block.provider!r} opaque content through AnthropicRuntime"
+                        )
+                    content.append(dict(block.data))
+                else:  # pragma: no cover
                     raise TypeError(f"unsupported model content: {type(block).__name__}")
             mapped_messages.append({"role": message.role, "content": content})
 
@@ -179,10 +180,7 @@ class AnthropicRuntime:
             last = mapped_messages[-1]
             if last["content"]:
                 last_content = list(last["content"])
-                last_content[-1] = {
-                    **last_content[-1],
-                    "cache_control": {"type": "ephemeral"},
-                }
+                last_content[-1] = {**last_content[-1], "cache_control": {"type": "ephemeral"}}
                 mapped_messages[-1] = {**last, "content": last_content}
         return mapped_messages
 
@@ -209,6 +207,14 @@ class AnthropicRuntime:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = self._map_tool_choice(request)
+        if request.provider_state is not None:
+            if request.provider_state.provider != self.provider:
+                raise ValueError(
+                    f"cannot send {request.provider_state.provider!r} provider state through AnthropicRuntime"
+                )
+            container = request.provider_state.data.get("container")
+            if container:
+                body["container"] = container
         return body
 
     def _usage(self, raw: Any) -> ModelUsage:
@@ -219,9 +225,7 @@ class AnthropicRuntime:
         input_tokens = _get(raw, "input_tokens")
         output_tokens = _get(raw, "output_tokens")
         cached_input = _get(raw, "cache_read_input_tokens")
-        total = None
-        if input_tokens is not None and output_tokens is not None:
-            total = input_tokens + output_tokens
+        total = input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None
         return ModelUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -255,13 +259,20 @@ class AnthropicRuntime:
                         provider_tool_call_id=provider_id,
                     )
                 )
+            else:
+                content.append(ProviderOpaqueContent(provider=self.provider, data=_plain(block)))
         return ModelMessage(role="assistant", content=content)
 
     def _response(self, raw: Any) -> ModelResponse:
+        container = _get(raw, "container")
+        container_id = _get(container, "id") if container is not None else None
         return ModelResponse(
             message=self._message(raw),
             stop_reason=self._stop_reason(_get(raw, "stop_reason")),
             usage=self._usage(_get(raw, "usage")),
+            provider_state=(
+                ProviderState(self.provider, {"container": container_id}) if container_id else None
+            ),
             provider_request_id=_get(raw, "id"),
         )
 
