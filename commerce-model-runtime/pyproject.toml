@@ -13,6 +13,7 @@ authors = [{ name = "Anthropic" }]
 dependencies = []
 
 [project.optional-dependencies]
+anthropic = ["anthropic>=0.91"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.15,<0.17"]
 
 [tool.hatch.build.targets.wheel]
