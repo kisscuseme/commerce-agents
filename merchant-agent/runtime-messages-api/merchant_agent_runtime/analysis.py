@@ -28,6 +28,7 @@ from commerce_model_runtime import (
     ToolResultContent,
     validate_capabilities,
 )
+from commerce_model_runtime.providers import AnthropicRuntime
 from commerce_common.delegation import DelegateExtension, DelegationContext
 from commerce_common.execution import without_status
 from commerce_common.model_round import accumulate_model_usage
@@ -74,6 +75,37 @@ _STEP_VERBS = {
 _PROGRESS_ONLY_GRACE = 3
 
 
+class _LegacyAnalysisAnthropicRuntime(AnthropicRuntime):
+    """V1 compatibility for tests/callers that inject the old Anthropic client directly.
+
+    The old analysis loop sent a one-text user message as a scalar string. The canonical
+    runtime path is provider-neutral; only this deprecated ``client=`` bridge preserves
+    that wire detail for existing consumers.
+    """
+
+    def _map_messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+        mapped = super()._map_messages(request)
+        for source, encoded in zip(request.messages, mapped, strict=True):
+            if (
+                source.role == "user"
+                and len(source.content) == 1
+                and isinstance(source.content[0], TextContent)
+                and isinstance(encoded.get("content"), list)
+            ):
+                encoded["content"] = source.content[0].text
+        return mapped
+
+
+def _coerce_runtime(runtime_or_client: Any) -> ModelRuntime:
+    if (
+        hasattr(runtime_or_client, "complete")
+        and hasattr(runtime_or_client, "capabilities_for")
+        and hasattr(runtime_or_client, "provider")
+    ):
+        return cast(ModelRuntime, runtime_or_client)
+    return _LegacyAnalysisAnthropicRuntime(client=runtime_or_client)
+
+
 def present_analysis(result: BaseModel, context: DelegationContext) -> tuple[Any, list[AgentEvent]]:
     analysis = cast(AnalysisResult, result)
     context.state.remember_analysis(analysis)
@@ -83,12 +115,12 @@ def present_analysis(result: BaseModel, context: DelegationContext) -> tuple[Any
 
 
 def build_analysis_delegate(
-    runtime: ModelRuntime,
+    runtime: ModelRuntime | Any,
     backend: MerchantBackend,
     config: MerchantAgentConfig,
 ) -> DelegateExtension:
     definition = build_analysis_tool_definition()
-    runner = AnalysisRunner(runtime=runtime, backend=backend, config=config)
+    runner = AnalysisRunner(runtime=_coerce_runtime(runtime), backend=backend, config=config)
     return DelegateExtension(
         name=ANALYSIS_TOOL,
         description=definition["description"],
@@ -105,8 +137,17 @@ def backend_supports_analysis_query(backend: MerchantBackend) -> bool:
 
 class AnalysisRunner:
     def __init__(
-        self, *, runtime: ModelRuntime, backend: MerchantBackend, config: MerchantAgentConfig
+        self,
+        *,
+        runtime: ModelRuntime | None = None,
+        client: Any | None = None,
+        backend: MerchantBackend,
+        config: MerchantAgentConfig,
     ) -> None:
+        if runtime is not None and client is not None:
+            raise ValueError("pass runtime= or client=, not both")
+        if runtime is None:
+            runtime = _LegacyAnalysisAnthropicRuntime(client=client)
         self._runtime = runtime
         self._backend = backend
         self._config = config
@@ -123,9 +164,12 @@ class AnalysisRunner:
         )
         self._system = build_analysis_system_prompt(config)
         self._sql_supported = backend_supports_analysis_query(backend)
+        # ``_tools`` stays as the historical raw contract for inspection/backward tests;
+        # model calls use the provider-neutral conversion exclusively.
         self._tools = self._build_tools()
+        self._model_tools = build_model_tools(self._tools)
 
-    def _build_tools(self):
+    def _build_tools(self) -> list[dict[str, Any]]:
         registry = build_tools(self._config, [])
         sql_only = self._sql_supported and self._config.analysis_sql_only
         tools = (
@@ -142,8 +186,14 @@ class AnalysisRunner:
         if self._sql_supported:
             tools.append(build_analysis_query_tool())
         if self._config.analysis_use_code_execution:
+            tools = [
+                {**tool, "allowed_callers": [CODE_EXECUTION_TOOL_TYPE]}
+                if "input_schema" in tool
+                else tool
+                for tool in tools
+            ]
             tools.append({"type": CODE_EXECUTION_TOOL_TYPE, "name": "code_execution"})
-        return build_model_tools(tools)
+        return tools
 
     async def _task_brief(self, session: Any, args: dict[str, Any]) -> str:
         def _clamp(value: Any, limit: int = 300) -> Any:
@@ -208,7 +258,7 @@ class AnalysisRunner:
                 ModelRequest(
                     target=self._target,
                     system=[SystemSegment(self._system, SegmentStability.STATIC)],
-                    tools=self._tools,
+                    tools=self._model_tools,
                     tool_choice=ToolChoice.auto(),
                     messages=messages,
                     max_tokens=self._config.analysis_max_tokens,
