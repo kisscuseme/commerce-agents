@@ -246,6 +246,15 @@ class ShoppingAgent:
                         break
 
                     for block in tool_uses:
+                        if block.id in unreadable:
+                            logger.warning(
+                                "tool input unreadable session=%s round=%d tool=%s id=%s chars=%d",
+                                session_tag(session.session_id),
+                                round_index,
+                                block.name,
+                                block.id,
+                                runner.malformed_input_chars(block.id),
+                            )
                         if block.id in unreadable or not dispatcher.started(block.id):
                             yield executor.tool_call_event(
                                 block.name, block.id, dict(block.arguments)
