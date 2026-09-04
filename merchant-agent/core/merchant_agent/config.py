@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
+from commerce_model_runtime import ModelTarget
 from commerce_common.config import BaseAgentConfig, ThinkingEffort
 
 
@@ -18,10 +19,11 @@ class MerchantAgentConfig(BaseAgentConfig):
     model: str = "claude-opus-5"
     thinking_effort: ThinkingEffort | None = "low"
 
-    # -- The analysis delegate. `analysis_model` None means the main model; the hosted
-    # code-execution tool needs the first-party API; with a backend that supports
-    # queries, `analysis_sql_only` leaves the per-series read tools off its surface.
+    # -- The analysis delegate. `analysis_model` None means the main model and
+    # `analysis_provider` None means the main provider. Hosted code execution remains an
+    # explicit deployment capability checked by the Messages runtime.
     enable_analysis: bool = False
+    analysis_provider: str | None = None
     analysis_model: str | None = None
     analysis_use_code_execution: bool = True
     analysis_sql_only: bool = True
@@ -29,27 +31,15 @@ class MerchantAgentConfig(BaseAgentConfig):
     analysis_max_tokens: int = Field(default=4096, ge=256)
     analysis_timeout_s: float = Field(default=120.0, gt=0)
     max_delegate_calls_per_turn: int = Field(default=2, ge=1)
-    # Applied to every query result, whatever size the backend returns.
     max_analysis_rows: int = Field(default=200, ge=1)
     max_analysis_table_chars: int = Field(default=8_000, ge=500)
     analysis_query_timeout_s: float = Field(default=10.0, gt=0)
 
-    # -- Systems the store operates. Metrics and the catalog reads are the floor; each
-    # switch below, turned off, removes that system's read and stage tools on every path,
-    # for a business that has no such system at all. With every write switched off, the
-    # change queue (get_pending_changes, apply_change, discard_change, the preview card)
-    # goes too. A system that exists and is not wired yet stays on: its backend method
-    # raises ChangeNotApplicable and the tool says so.
     enable_listing_edits: bool = True
     enable_inventory: bool = True
     enable_pricing: bool = True
     enable_campaigns: bool = True
 
-    # -- Guardrails, checked when a change is staged and again before it is applied.
-    # `price_bearing_fields` and `listing_update_blocked_fields` are extended, never
-    # replaced, when a domain prices under another name. `max_items_per_change` counts
-    # the lines the operator will approve, so a promotion on a family counts once per
-    # variant it expands to.
     max_items_per_change: int = Field(default=25, ge=1)
     max_price_delta_pct: float = Field(default=20.0, gt=0)
     max_promotion_discount_pct: float = Field(default=50.0, gt=0, le=90)
@@ -65,25 +55,10 @@ class MerchantAgentConfig(BaseAgentConfig):
     price_bearing_fields: tuple[str, ...] = ("price",)
     listing_update_blocked_fields: tuple[str, ...] = ("price", "stock")
 
-    # -- Approval (prompt). With `require_host_approval` on, apply_change succeeds only
-    # for ids the host marked on MerchantSessionState.approved_change_ids; a deployment
-    # that trusts the conversational flow opts out. `approval_surface` names the host's
-    # affordance in refusals and prompt guidance. With `stage_shows_preview` on, a
-    # successful stage_* call renders the change preview card itself (prompt and tool
-    # text say so); a deployment whose executor events do not reach the operator, the
-    # MCP server, turns it off and the model shows the change with present_change_preview.
     require_host_approval: bool = True
     approval_surface: str = "the host application's approval control"
     stage_shows_preview: bool = True
 
-    # -- Grounding gates (the runtimes read them). Metrics: a performance term plus a
-    # question cue forces get_business_snapshot. Follow-through: a change term (or a
-    # money or percent literal) plus an imperative cue marks the turn as a change
-    # request, and a turn that would end without a stage_* attempt, on text or on its
-    # chips, gets one reminder first; the cues exclude approval verbs so approving
-    # staged work never re-fires it. Queue: a
-    # change request that also carries an apply phrase, with nothing staged this
-    # session, forces get_pending_changes.
     metrics_grounding_gate: bool = True
     metrics_intent_terms: tuple[str, ...] = (
         "sales",
@@ -188,6 +163,12 @@ class MerchantAgentConfig(BaseAgentConfig):
         "push it through",
         "push through",
     )
+
+    def analysis_target(self) -> ModelTarget:
+        return ModelTarget(
+            self.analysis_provider or self.provider,
+            self.analysis_model or self.model,
+        )
 
     @property
     def stages_changes(self) -> bool:
