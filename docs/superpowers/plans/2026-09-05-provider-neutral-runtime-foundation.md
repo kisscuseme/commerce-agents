@@ -27,10 +27,10 @@
 
 **Files:**
 - Create: `commerce-model-runtime/pyproject.toml`
-- Create: `commerce-model-runtime/commerce_model_runtime/{__init__,types,events,runtime,errors}.py`
+- Create: `commerce-model-runtime/commerce_model_runtime/{__init__,types,events,errors}.py`
 - Test: `commerce-model-runtime/tests/test_types.py`
 
-**Interfaces:** Produces `ModelTarget`, `ModelRequest`, `ModelResponse`, `ModelMessage`, content/tool types, `ToolChoice`, `ReasoningConfig`, `CachePolicy`, `ProviderState`, `ModelUsage`, canonical events, and `ModelRuntime`.
+**Interfaces:** Produces `ModelTarget`, `ModelRequest`, `ModelResponse`, `ModelMessage`, content/tool types, `ToolChoice`, `ReasoningConfig`, `CachePolicy`, `ProviderState`, `ModelUsage`, and canonical stream event classes.
 
 - [ ] **Step 1: Write failing canonical type tests**
 
@@ -51,26 +51,30 @@ def test_specific_tool_choice_requires_name():
 ```
 
 - [ ] **Step 2: Run `pytest commerce-model-runtime/tests/test_types.py -v` and verify import failures.**
-- [ ] **Step 3: Implement dataclasses/enums/protocol.** `ModelUsage` unavailable counters are `None`, not zero; `ProviderState.data` is JSON-serializable `dict[str, Any]`.
+- [ ] **Step 3: Implement dataclasses/enums/events.** `ModelUsage` unavailable counters are `None`, not zero; `ProviderState.data` is JSON-serializable `dict[str, Any]`.
 - [ ] **Step 4: Re-run the test and verify PASS.**
 - [ ] **Step 5: Commit:** `git commit -m "feat: add provider-neutral model runtime types"`.
 
 ---
 
-### Task 2: Capability validation and runtime registry
+### Task 2: Capability validation, `ModelRuntime`, and runtime registry
 
 **Files:**
 - Create: `commerce-model-runtime/commerce_model_runtime/capabilities.py`
+- Create: `commerce-model-runtime/commerce_model_runtime/runtime.py`
 - Create: `commerce-model-runtime/commerce_model_runtime/registry.py`
 - Test: `commerce-model-runtime/tests/test_{capabilities,registry}.py`
 
-**Interfaces:** Produces `ModelCapabilities`, `ModelOperation`, `CapabilityPlan`, `CapabilityValidationError`, and `RuntimeRegistry`.
+**Interfaces:** Produces `ModelCapabilities`, `ModelOperation`, `CapabilityPlan`, `CapabilityValidationError`, `ModelRuntime`, and `RuntimeRegistry`.
 
 - [ ] **Step 1: Write failing operation-aware validation tests.**
 
 ```python
+from dataclasses import replace
+
+
 def test_main_turn_rejects_missing_specific_tool_choice():
-    caps = ModelCapabilities.full().replace(tool_choice_specific=False)
+    caps = replace(ModelCapabilities.full(), tool_choice_specific=False)
     with pytest.raises(CapabilityValidationError):
         validate_capabilities(ModelOperation.MAIN_TURN, caps, enable_web_search=False)
 ```
@@ -78,7 +82,21 @@ def test_main_turn_rejects_missing_specific_tool_choice():
 Also assert missing `prompt_cache` produces DEGRADED rather than INVALID.
 - [ ] **Step 2: Run the two test files and verify failure.**
 - [ ] **Step 3: Implement rules from the spec:** main turn requires streaming/function tools/continuation/auto-none-specific/multiple calls; memory and portable analysis use non-streaming requirements; web search is required only when enabled; prompt cache and streamed args are optional.
-- [ ] **Step 4: Implement registry resolution errors for unregistered providers and run tests.**
+- [ ] **Step 4: Define the protocol after `ModelCapabilities` exists:**
+
+```python
+class ModelRuntime(Protocol):
+    @property
+    def provider(self) -> str: ...
+
+    def capabilities_for(self, target: ModelTarget) -> ModelCapabilities: ...
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]: ...
+
+    async def complete(self, request: ModelRequest) -> ModelResponse: ...
+```
+
+Then implement registry resolution errors for unregistered providers and run tests.
 - [ ] **Step 5: Commit:** `git commit -m "feat: add runtime capability validation"`.
 
 ---
