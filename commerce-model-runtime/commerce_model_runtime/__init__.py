@@ -1,3 +1,12 @@
+from .capabilities import (
+    CapabilityPlan,
+    CapabilityStatus,
+    CapabilityValidationError,
+    ModelCapabilities,
+    ModelOperation,
+    validate_capabilities,
+)
+from .registry import RuntimeNotRegisteredError, RuntimeRegistry
 from .errors import (
     AuthenticationError,
     InvalidRequestError,
@@ -47,6 +56,13 @@ from .types import (
 )
 
 __all__ = [
+    "CapabilityPlan",
+    "CapabilityStatus",
+    "CapabilityValidationError",
+    "ModelCapabilities",
+    "ModelOperation",
+    "RuntimeNotRegisteredError",
+    "RuntimeRegistry",
     "AuthenticationError",
     "BuiltinToolSpec",
     "CachePolicy",
@@ -88,4 +104,5 @@ __all__ = [
     "TransientProviderError",
     "UnsupportedCapabilityError",
     "UsageUpdated",
+    "validate_capabilities",
 ]
